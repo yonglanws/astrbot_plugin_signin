@@ -1,9 +1,4 @@
-# helloworld
+# 签到插件
 
-AstrBot 插件模板
-
-A template plugin for AstrBot plugin feature
-
-# 支持
-
-[帮助文档](https://astrbot.app)
+一个astrbot签到插件，使用 AstrBot Text2Image Playground 服务生成签到图片
+main.py内有HTML的模板
