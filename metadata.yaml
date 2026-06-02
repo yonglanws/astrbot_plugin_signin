@@ -1,0 +1,7 @@
+name: astrbot_plugin_signin
+display_name: 世界计划签到插件
+desc: 功能丰富的签到打卡插件
+version: v2.0.0
+author: ylws (慵懒午睡)
+repo: https://github.com/yonglanws/astrbot_plugin_signin
+config: true

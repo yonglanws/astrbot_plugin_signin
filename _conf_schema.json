@@ -1,0 +1,14 @@
+{
+    "sign_in_command": {
+        "description": "签到指令名称",
+        "type": "string",
+        "hint": "用户发送此消息触发签到功能",
+        "default": "签到"
+    },
+    "footer_text": {
+        "description": "签到卡片底部文本",
+        "type": "string",
+        "hint": "签到卡片底部显示的文本，支持自定义",
+        "default": "XXX Bot by XXX | 请勿迷信哦🥺"
+    }
+}
