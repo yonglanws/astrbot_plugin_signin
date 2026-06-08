@@ -5,6 +5,8 @@ import secrets
 import shutil
 import sqlite3
 import threading
+import io
+from PIL import Image
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
@@ -612,7 +614,7 @@ TMPL = """
             {% endif %}
 
             <div class="footer">
-                {{footer_text}}
+                Designed by 慵懒午睡 | 请勿迷信哦
             </div>
         </div>
         <!-- 右侧面板：留空 -->
@@ -853,6 +855,100 @@ class MyPlugin(Star):
                 except Exception as e:
                     logger.error(f"❌ 增量同步失败 {item.name}: {e}")
 
+    def _compress_image(self, img_data: bytes, max_size: int = 800, quality: int = 75, fmt: str = "WEBP") -> tuple[str, bytes]:
+        """压缩图片：缩放 + 转格式，返回 (mime_type, compressed_bytes)"""
+        try:
+            img = Image.open(io.BytesIO(img_data))
+            # 缩放：保持比例，最长边不超过 max_size
+            w, h = img.size
+            if max(w, h) > max_size:
+                ratio = max_size / max(w, h)
+                new_w, new_h = int(w * ratio), int(h * ratio)
+                img = img.resize((new_w, new_h), Image.LANCZOS)
+            # 转换格式
+            if fmt == "WEBP":
+                mime = "image/webp"
+                save_fmt = "WEBP"
+            else:
+                mime = "image/jpeg"
+                save_fmt = "JPEG"
+            buf = io.BytesIO()
+            # JPEG 不支持 alpha 通道
+            if save_fmt == "JPEG" and img.mode in ("RGBA", "LA", "P"):
+                img = img.convert("RGB")
+            img.save(buf, format=save_fmt, quality=quality, optimize=True)
+            return mime, buf.getvalue()
+        except Exception as e:
+            logger.warning(f"图片压缩失败，使用原始数据: {e}")
+            return None, img_data
+
+    def _image_to_base64(self, img_data: bytes, max_size: int = 800, quality: int = 75, fmt: str = "WEBP") -> str:
+        """将图片数据压缩后转为 base64 data URI"""
+        mime, compressed = self._compress_image(img_data, max_size, quality, fmt)
+        if mime is None:
+            # 压缩失败，使用原始数据
+            return f"data:image/png;base64,{base64.b64encode(img_data).decode('utf-8')}"
+        return f"data:{mime};base64,{base64.b64encode(compressed).decode('utf-8')}"
+
+    def _recompress_image_url(self, url: str, target_kb: int = 100) -> str:
+        """对渲染后的图片进行二次压缩，目标大小为 target_kb KB"""
+        try:
+            # 提取 base64 数据
+            if url.startswith("data:"):
+                header, b64data = url.split(",", 1)
+                img_bytes = base64.b64decode(b64data)
+            elif os.path.exists(url):
+                with open(url, 'rb') as f:
+                    img_bytes = f.read()
+            else:
+                return url  # URL 格式，无法压缩
+
+            original_kb = len(img_bytes) / 1024
+            if original_kb <= target_kb:
+                logger.info(f"📦 图片 {original_kb:.1f}KB <= 目标 {target_kb}KB，无需二次压缩")
+                return url
+
+            img = Image.open(io.BytesIO(img_bytes))
+            if img.mode in ("RGBA", "LA", "P"):
+                img = img.convert("RGB")
+
+            # 二分法查找合适的 quality 值
+            lo, hi = 10, 85
+            result_bytes = img_bytes
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=mid, optimize=True)
+                size_kb = buf.tell() / 1024
+                if size_kb <= target_kb:
+                    result_bytes = buf.getvalue()
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+
+            # 如果 quality 最低还是太大，缩小尺寸
+            final_kb = len(result_bytes) / 1024
+            if final_kb > target_kb:
+                scale = 0.9
+                for _ in range(5):
+                    w, h = img.size
+                    new_w, new_h = int(w * scale), int(h * scale)
+                    resized = img.resize((new_w, new_h), Image.LANCZOS)
+                    buf = io.BytesIO()
+                    resized.save(buf, format="JPEG", quality=30, optimize=True)
+                    result_bytes = buf.getvalue()
+                    final_kb = len(result_bytes) / 1024
+                    if final_kb <= target_kb:
+                        break
+                    scale *= 0.9
+
+            final_kb = len(result_bytes) / 1024
+            logger.info(f"📦 二次压缩: {original_kb:.1f}KB -> {final_kb:.1f}KB (目标 {target_kb}KB)")
+            return f"data:image/jpeg;base64,{base64.b64encode(result_bytes).decode('utf-8')}"
+        except Exception as e:
+            logger.warning(f"二次压缩失败，使用原始图片: {e}")
+            return url
+
     def _load_images_base64(self):
         """按人物加载图片资源，每个人物包含 ok/yi/ji 图片和卡面背景"""
         self.character_images = {}
@@ -885,7 +981,7 @@ class MyPlugin(Star):
                     try:
                         with open(path, 'rb') as f:
                             img_data = f.read()
-                            self.character_images[char][name] = f"data:image/png;base64,{base64.b64encode(img_data).decode('utf-8')}"
+                            self.character_images[char][name] = self._image_to_base64(img_data, max_size=300, quality=55, fmt="WEBP")
                         logger.info(f"✅ 成功加载图片: {char}/{path.name}")
                     except Exception as e:
                         logger.error(f"❌ 加载图片失败 {char}/{path.name}: {e}")
@@ -916,7 +1012,7 @@ class MyPlugin(Star):
         return self.character_images.get(character, {})
 
     def _get_random_bg(self, character):
-        """从指定人物的卡面资源中随机选择一张背景卡图并转为base64"""
+        """从指定人物的卡面资源中随机选择一张背景卡图并转为base64（不压缩，保持原画质）"""
         cards = self.character_cards.get(character, [])
         if not cards:
             return ""
@@ -1200,12 +1296,7 @@ class MyPlugin(Star):
                 try:
                     with open(cover_path, 'rb') as f:
                         img_data = f.read()
-                        if used_ext == ".webp":
-                            cover_base64 = f"data:image/webp;base64,{base64.b64encode(img_data).decode('utf-8')}"
-                        elif used_ext in [".jpg", ".jpeg"]:
-                            cover_base64 = f"data:image/jpeg;base64,{base64.b64encode(img_data).decode('utf-8')}"
-                        else:
-                            cover_base64 = f"data:image/png;base64,{base64.b64encode(img_data).decode('utf-8')}"
+                        cover_base64 = self._image_to_base64(img_data, max_size=200, quality=50, fmt="WEBP")
                 except Exception as e:
                     logger.warning(f"加载歌曲封面失败: {cover_path} - {e}")
 
@@ -1308,7 +1399,8 @@ class MyPlugin(Star):
             if specified_character:
                 logger.info(f"🎯 用户指定角色: {char_query} -> {specified_character}")
             else:
-                logger.warning(f"⚠️ 未找到角色: {char_query}，将随机选择")
+                logger.warning(f"⚠️ 未找到角色: {char_query}，静默忽略")
+                return
 
         user_id = event.get_sender_id()
         user_name = event.get_sender_name()
@@ -1437,12 +1529,12 @@ class MyPlugin(Star):
         ui_settings = self.config.get('ui_settings', {})
 
         options = {
-            "quality": 60,
-            "device_scale_factor_level": "ultra",
+            "quality": 30,
+            "device_scale_factor_level": "high",
             "full_page": True,
             "omit_background": False,
             "type": "jpeg",
-            "viewport": {"width": 2400, "height": 2160}
+            "viewport": {"width": 800, "height": 720}
         }
 
         song1 = songs[0] if songs and len(songs) >= 1 else {"name": "", "name_cn": "名称：未知歌曲", "cover_base64": "", "difficulty_type": None, "difficulty_level": None, "difficulty_label": None}
@@ -1483,6 +1575,9 @@ class MyPlugin(Star):
 
             url = await self.html_render(TMPL, render_data, options=options)
 
+            # 二次压缩：确保最终图片在 100KB 左右
+            url = self._recompress_image_url(url, target_kb=100)
+
             yield event.image_result(url)
         except Exception as e:
             error_type = type(e).__name__
@@ -1501,19 +1596,16 @@ class MyPlugin(Star):
         """图片渲染失败时，构建文字版签到内容"""
         lines = []
         lines.append(f"🎉 {user_name}，签到成功！")
-        lines.append("")
 
         if fortune_data:
             level = fortune_data.get('level', '未知')
             desc = fortune_data.get('desc', '')
             lines.append(f"✨ 今日运势：{level} {desc}")
-            lines.append("")
 
         if yi_text:
             lines.append(f"✅ 宜：{yi_text}")
         if ji_text:
             lines.append(f"❌ 忌：{ji_text}")
-        lines.append("")
 
         if songs and len(songs) > 0:
             lines.append("🎵 今日歌曲推荐：")
