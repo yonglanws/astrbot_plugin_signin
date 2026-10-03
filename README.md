@@ -1,4 +1,4 @@
-# AstrBot 世界计划签到插件
+# 世界计划风格签到插件
 
 # 注意
 需要提前将数据配置到持久化目录，否则插件无法正常运行。
@@ -85,7 +85,3 @@ A: 检查持久化目录 `AstrBot/data/plugin_data/astrbot_plugin_signin/img/`�
 
 **Q: 如何备份数据？**  
 A: 复制持久化目录下的 `signin.db`。
-
-## 许可证
-
-GPLv3
