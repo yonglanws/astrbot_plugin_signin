@@ -702,7 +702,7 @@ TMPL = """
 """
 
 
-@register("astrbot_plugin_signin", "慵懒午睡", "增强版签到插件 - 支持连续签到、歌曲推荐", "2.0.0")
+@register("astrbot_plugin_signin", "慵懒午睡", "增强版签到插件 - 支持连续签到、歌曲推荐", "2.3.0")
 
 
 class MyPlugin(Star):
@@ -745,6 +745,15 @@ class MyPlugin(Star):
                 logger.info(f"✅ 数据迁移完成，旧文件已备份为: {backup_file.name}")
         except Exception as e:
             logger.warning(f"⚠️ 数据迁移失败（可忽略）: {e}")
+
+        # 启动时在后台执行一次每日清理（删除过期数据并回收空间），不阻塞加载
+        self.history_keep_days = int(self.config.get('history_keep_days', 365) or 365)
+        threading.Thread(
+            target=self.db.maybe_cleanup,
+            args=(self.history_keep_days,),
+            name="signin-db-startup-cleanup",
+            daemon=True
+        ).start()
 
         font_path = self.plugin_dir / "MiSans-Medium.ttf"
         if font_path.exists():
@@ -1362,10 +1371,10 @@ class MyPlugin(Star):
             '给好友写信', '制定计划', '跑步运动',
             '参观博物馆', '逛书店', '手工DIY', '整理衣橱', '学习摄影',
             '看演唱会', '参加读书会', '整理笔记',
-            '做志愿者', '学习舞蹈', '玩桌游'
+            '做志愿者', '学习舞蹈', '玩桌游',
             '学习烹饪', '品咖啡', '逛花市', '看日出',
             '整理音乐列表',
-            '写短篇小说', '学习插花', '制作手账', '学习滑板', '放风筝'
+            '写短篇小说', '学习插花', '制作手账'
         ]
         return random.choice(good_fortunes)
 
@@ -1377,6 +1386,33 @@ class MyPlugin(Star):
             '毒唯行为', '引战', '剧透未看番', '滥用表情包', '刷存在感', '跟风黑角色'
         ]
         return random.choice(bad_fortunes)
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.PRIVATE_MESSAGE)
+    async def set_nickname_handler(self, event: AstrMessageEvent):
+        """设置签到昵称指令"""
+        message_text = event.message_str.strip()
+        if not message_text.startswith("设置签到昵称"):
+            return
+
+        nickname = message_text[len("设置签到昵称"):].strip()
+        if not nickname:
+            yield event.plain_result("⚠️ 请提供昵称，用法：设置签到昵称 你的昵称")
+            return
+
+        user_id = event.get_sender_id()
+        if not user_id:
+            yield event.plain_result("⚠️ 无法获取用户ID，设置失败")
+            return
+
+        ctx_id = self._get_context_id(event)
+        try:
+            if self.db.set_nickname(ctx_id, user_id, nickname):
+                yield event.plain_result(f"✅ 签到昵称已设置为：{nickname}")
+            else:
+                yield event.plain_result("⚠️ 设置失败，请稍后重试")
+        except Exception as e:
+            logger.error(f"❌ 设置签到昵称失败: {e}")
+            yield event.plain_result("⚠️ 设置失败，请稍后重试")
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.PRIVATE_MESSAGE)
     async def listen_signin(self, event: AstrMessageEvent):
@@ -1406,14 +1442,41 @@ class MyPlugin(Star):
         user_name = event.get_sender_name()
         ctx_id = self._get_context_id(event)
 
-        if not user_id or not user_name:
-            logger.warning(f"无法获取用户信息: user_id={user_id}, user_name={user_name}")
+        if not user_id:
+            logger.warning(f"无法获取用户ID，跳过签到")
             return
+
+        # 获取昵称优先级：自定义昵称 > 平台昵称 > 默认
+        custom_nickname = ""
+        try:
+            custom_nickname = self.db.get_nickname(ctx_id, user_id)
+        except Exception as e:
+            logger.warning(f"获取自定义昵称失败: {e}")
+
+        nickname_missing = False
+        if custom_nickname:
+            display_name = custom_nickname
+        elif user_name:
+            display_name = user_name
+        else:
+            # 平台未返回昵称且未设置自定义昵称：仍允许签到，使用默认名
+            display_name = ""
+            nickname_missing = True
+            logger.warning(f"获取用户昵称失败: user_id={user_id}")
+
+        # 用最终展示名替换 user_name 用于后续渲染/记录
+        user_name = display_name
 
         streak_days = 1
         signed_dates = []
         
         if not is_test:
+            # 每日过期数据清理（maybe_cleanup 内部按天去重，重复调用几乎零开销）
+            try:
+                self.db.maybe_cleanup(self.history_keep_days)
+            except Exception as e:
+                logger.warning(f"⚠️ 触发每日清理失败: {e}")
+
             today = datetime.now().strftime("%Y-%m-%d")
 
             try:
@@ -1579,6 +1642,12 @@ class MyPlugin(Star):
             url = self._recompress_image_url(url, target_kb=100)
 
             yield event.image_result(url)
+
+            # 昵称缺失提示（不影响签到本身）
+            if nickname_missing:
+                yield event.plain_result(
+                    "⚠️ 由于QQ官方机器人的限制，获取用户昵称失败，请使用“设置签到昵称 昵称”指令手动设置签到昵称"
+                )
         except Exception as e:
             error_type = type(e).__name__
             logger.error(f"❌ 渲染签到卡片失败 [{error_type}]: {e}")
@@ -1716,9 +1785,19 @@ class SigninDatabase:
                 CREATE INDEX IF NOT EXISTS idx_user_ctx 
                     ON users(ctx_id, user_id);
 
-                CREATE INDEX IF NOT EXISTS idx_daily_state_date 
+                CREATE INDEX IF NOT EXISTS idx_daily_state_date
                     ON daily_signin_state(user_ref, signin_date);
+
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
             """)
+            # 兼容旧库：增量添加 nickname 列
+            try:
+                conn.execute("ALTER TABLE users ADD COLUMN nickname TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass  # 列已存在
             conn.commit()
 
     def migrate_from_json(self, json_data: dict):
@@ -1772,6 +1851,28 @@ class SigninDatabase:
             
             return dict(row) if row else {}
 
+    def set_nickname(self, ctx_id: str, user_id: str, nickname: str) -> bool:
+        """设置用户签到昵称"""
+        with self._get_conn() as conn:
+            user = self.get_or_create_user(ctx_id, user_id)
+            if not user:
+                return False
+            conn.execute(
+                "UPDATE users SET nickname = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (nickname, user['id'])
+            )
+            conn.commit()
+            return True
+
+    def get_nickname(self, ctx_id: str, user_id: str) -> str:
+        """获取用户自定义昵称，未设置返回空字符串"""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT nickname FROM users WHERE ctx_id = ? AND user_id = ?",
+                (ctx_id, user_id)
+            ).fetchone()
+            return row['nickname'] if row and row['nickname'] else ''
+
     def record_checkin(self, ctx_id: str, user_id: str, username: str) -> bool:
         today = datetime.now().strftime("%Y-%m-%d")
         
@@ -1795,22 +1896,21 @@ class SigninDatabase:
             )
             
             streak = self._calculate_streak(user['id'])
-            total = conn.execute(
-                "SELECT COUNT(*) FROM checkin_history WHERE user_ref = ?", 
-                (user['id'],)
-            ).fetchone()[0]
+            # 只有当天没有记录时才会走到这里，+1 即为准确的累计次数；
+            # 不再从 checkin_history 重算，避免清理历史后累计次数缩水
+            total = (user.get('total_checkins', 0) or 0) + 1
             
             max_streak = self._calculate_max_streak(user['id'])
             
             conn.execute("""
-                UPDATE users SET 
+                UPDATE users SET
                     last_checkin = ?,
                     total_checkins = ?,
                     current_streak = ?,
                     max_streak = MAX(max_streak, ?),
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
-            """, (today, total, streak, max_streak, streak, user['id']))
+            """, (today, total, streak, max_streak, user['id']))
             
             conn.commit()
             logger.info(f"✅ 签到记录已保存到数据库: {username}({user_id}) @ {ctx_id}")
@@ -1962,6 +2062,82 @@ class SigninDatabase:
                 return None
             
             return dict(row)
+
+    def get_meta(self, key: str) -> str:
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+            return row[0] if row else None
+
+    def set_meta(self, key: str, value: str):
+        with self._get_conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                (key, value)
+            )
+            conn.commit()
+
+    def cleanup_old_data(self, keep_days: int = 365) -> int:
+        """删除过期的每日签到状态和签到历史，返回删除的总行数。
+
+        daily_signin_state 只在当天被读取（get_daily_state 按当天日期查询），
+        过期行是纯死数据（含大体积歌曲封面 base64），全部清除；
+        checkin_history 保留最近 keep_days 天，足够月历显示和连续签到计算。
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+        history_cutoff = (datetime.now() - timedelta(days=max(1, keep_days))).strftime("%Y-%m-%d")
+
+        deleted = 0
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM daily_signin_state WHERE signin_date < ?",
+                (today,)
+            )
+            deleted += max(0, cur.rowcount)
+
+            cur = conn.execute(
+                "DELETE FROM checkin_history WHERE checkin_date < ?",
+                (history_cutoff,)
+            )
+            deleted += max(0, cur.rowcount)
+
+            conn.commit()
+        return deleted
+
+    def _vacuum_if_needed(self, min_free_pages: int = 256):
+        """在后台线程中执行：有空闲页时回收磁盘空间（256 页 ≈ 1MB）"""
+        try:
+            conn = self._get_conn()
+            free_pages = conn.execute("PRAGMA freelist_count").fetchone()[0]
+            if free_pages >= min_free_pages:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.execute("VACUUM")
+                logger.info(f"🧹 数据库空间回收完成（VACUUM 释放 {free_pages} 页）")
+        except Exception as e:
+            logger.warning(f"⚠️ 数据库空间回收失败: {e}")
+        finally:
+            self.close()
+
+    def maybe_cleanup(self, keep_days: int = 365):
+        """每天最多执行一次过期数据清理，删除后异步回收文件空间。
+
+        通过 meta 表记录上次清理日期，进程重启后不会重复执行当天的清理。
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self.get_meta('last_cleanup_date') == today:
+            return
+
+        try:
+            deleted = self.cleanup_old_data(keep_days)
+            self.set_meta('last_cleanup_date', today)
+            if deleted > 0:
+                logger.info(f"🧹 数据库每日清理完成，删除 {deleted} 条过期记录")
+            threading.Thread(
+                target=self._vacuum_if_needed,
+                name="signin-db-vacuum",
+                daemon=True
+            ).start()
+        except Exception as e:
+            logger.warning(f"⚠️ 数据库每日清理失败: {e}")
 
     def close(self):
         if hasattr(self._local, 'conn') and self._local.conn:
